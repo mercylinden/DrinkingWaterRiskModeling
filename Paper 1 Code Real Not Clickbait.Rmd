@@ -1,0 +1,603 @@
+---
+title: "Paper1Code"
+author: "Mercy Neal"
+date: "2026-04-10"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Library Input
+```{r}
+library('tidyverse')
+library('tidyr')
+library('readr')
+library('data.table')
+library('purrr')
+library('mpower')
+library('EnvStats')
+```
+Data Import
+```{r}
+dbptox <- read_csv("totaldbp.csv")
+chemconc <- read_csv("dbps.csv")
+qmra <- read_csv('QMRAmodels.csv')
+disease_data <- read_csv("finaldiseasedata.csv")
+rare <- read.csv('16Sgenusrare.csv')
+qmra <- read_csv('QMRAmodels.csv')
+
+rareweight <- rare %>%
+  mutate_at(vars(-Genus), funs(./sum(.))) 
+rareweight
+col_names <- names(rare[2:72])
+rarelong <- pivot_longer(rareweight, all_of(col_names), names_to = 'Date', values_to = 'Reads')
+qmra <- c('Legionella_pneumophila', 'Mycobacterium_avium')
+rareqmra <- rarelong %>%
+  filter(Genus %in% qmra)
+
+## Long Chemical
+chem_names <- names(chemconc[5:40])
+chemconc <- chemconc %>%
+  mutate_at(vars(chem_names), as.numeric)
+chem_long <- pivot_longer(chemconc, chem_names, names_to = 'Compound', values_to = 'Concentration')
+```
+
+Constants
+```{r}
+# Constants for dose calculations
+Efreq = 365 #day/year
+Eduration = 1 #year
+Avgtime = 25550 #day
+QLflow = 5.0 * 10^-3 #m^3 / min
+Qgflow = 5.0*10^-2 #m^3 / min
+BodW = 70 #mg
+AT = 25550
+AE = 100 #%
+CF = 1.67*10^-4 #Conversion factor for cm/hr to m/min
+# Mass transfer coefficients (KolA) (m^3/min)
+mtchclbr2 <- 4.6*10^-3
+mtchcl2br <- 5.9*10^-3
+mtchbr3 <- 3.7*10^-3
+mtchcl3 <- 7.4*10^-3
+KolAvg <- (mtchclbr2 +mtchcl2br + mtchbr3 + mtchcl3)/4
+# Chemical Specific dermal permeability constant (cm/hr)
+pcchclbr2 <- 2.98*10^-3
+pcchcl2br <- 4.02*10^-3
+pcchbr3 <- 2.35*10^-3
+pcchcl3 <- 7.4*10^-3
+PCavg <- (pcchclbr2 + pcchbr3 + pcchcl3 + pcchcl2br)/4
+# Henry's Constant values for each DBP @ 298.15K and ideal gas, with 40 degree water
+HCFM <- 0.37
+HBFM <- 0.061
+HBDCM <- 0.197
+HDBCM <- 0.108
+Henryavg <- (HCFM + HBFM + HBDCM + HDBCM)/4
+```
+
+#Monte Carlo Conditions for Exposure
+Conditions are generated from standard distributions from the EPA. 
+
+```{r}
+# Monte-Carlo
+conditions <- function(samp, seedchem = NULL){ 
+  if (!is.null(seedchem)) {
+    set.seed(seedchem)
+  } else {
+    warning("No seed provided!", call. = FALSE)
+    seedchem <- sample.int(10000, 1)
+    set.seed(seedchem)
+    message("Random seed = ", seedchem, "\n")
+  }
+
+  # Create arrays of different variables based on known distributions
+  parameters <- data.frame(
+    breath   = runif(samp, min = 0.013, max = 0.017),
+    time     = runif(samp, min = 5, max = 25),
+    enrich   = rtri(samp, min = 100, max = 10000, mode = 1000),
+    volume   = runif(samp, min = 2, max = 18),
+    volumenorm <- rnorm(10000, 10, 4),
+    ingestion = runif(samp, min = 1e-3, max = 3e-3),
+    SA       = runif(samp, min = 1.53, max = 1.94),
+    pctpathogenma = runif(samp, min = 0.4, max = 0.6),
+    pctpathogenleg = runif(samp, min = 0.005, max = 0.01),
+    pctpathogenclos = runif(samp, min = 0.005, max = 0.01)
+  )
+
+  ## Monte Carlo droplet dispersion (cvd)
+  cvd_storage <- numeric(samp)
+
+  for (s in seq_len(samp)) {
+    cvd <- 0
+    for (i in 1:10) {
+      if (i == 1) {
+        cvd <- cvd + (rlnorm(1, 17.5, 0.3) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.23, 0.25))
+      } else if (i == 2) {
+        cvd <- cvd + (rlnorm(1, 17.5, 0.17) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.4, 0.53))
+      } else if (i == 3) {
+        cvd <- cvd + (rlnorm(1, 19.4, 0.35) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.36, 0.62))
+      } else if (i == 4) {
+        cvd <- cvd + (rlnorm(1, 19.4, 0.35) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.29, 0.61))
+      } else if (i == 5) {
+        cvd <- cvd + (rlnorm(1, 19.4, 0.35) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.19, 0.52))
+      } else if (i == 6) {
+        cvd <- cvd + (rlnorm(1, 19.4, 0.35) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.10, 0.4))
+      } else if (i == 7) {
+        cvd <- cvd + (rlnorm(1, 20.0, 0.31) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.06, 0.29))
+      } else if (i == 8) {
+        cvd <- cvd + (rlnorm(1, 20.0, 0.31) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.03, 0.19))
+      } else if (i == 9) {
+        cvd <- cvd + (rlnorm(1, 20.0, 0.31) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.01, 0.12))
+      } else if (i == 10) {
+        cvd <- cvd + (rlnorm(1, 17.5, 0.3) * ((pi/6)*((i*10^-6)^3)) * runif(1, 0.01, 0.06))
+      }
+    }
+    cvd_storage[s] <- cvd
+  }
+
+  # Add cvd into the final dataset
+  parameters$cvd <- cvd_storage
+
+  return(parameters)
+}
+
+conds <- conditions(10000, 123)
+```
+
+
+Calculations start here:
+
+Exposure Models
+``` {r}
+# Dose calculation function 
+calculate_airconc <- function(concentration, condition) { 
+  Vs <- condition$volume 
+  Cw <- concentration 
+  t <- condition$time 
+  N = (KolAvg)/ QLflow 
+  a = (QLflow *Cw *(1-exp(-N)))/Vs 
+  b = (((QLflow/Henryavg) *(1-exp(-N)))+Qgflow)/Vs 
+  Cst = (1-exp(-b * t))* (a/b) 
+  Cair <- (Cst)/2 
+  return(Cair) }
+
+
+calculate_dose <- function(chemconc, bioconc, mc, airconcentration,
+                           chemname, bioname,
+                           sampleid, sampling_date, sample_type) {
+
+  # --- Concentrations ---
+  Cwbio  <- bioconc
+  Cwchem <- chemconc
+
+  # --- Exposure parameters ---
+  SurfArea     <- mc$SA
+  IR           <- mc$ingestion
+  Exposuretime <- mc$time
+  breath       <- mc$breath
+  enrich       <- mc$enrich
+  cvd          <- mc$cvd
+
+  # --- Chemical dose ---
+  InhaledChem <- (airconcentration * Exposuretime * Efreq * Eduration) / AT
+  OralChem    <- (Cwchem * IR * Efreq * Eduration) / (BodW * AT)
+
+  # --- Biological dose ---
+  InhaledBio <- Cwbio * breath * Exposuretime * enrich * cvd
+
+  # --- RETURN ONE ROW ---
+  tibble::tibble(
+    `SAMPLE ID`    = sampleid,
+    SamplingDate   = sampling_date,
+    SampleType     = sample_type,
+    Chemical       = chemname,
+    Pathogen       = bioname,
+    InhaledChem    = InhaledChem,
+    OralChem       = OralChem,
+    InhaledBio     = InhaledBio
+  )
+}
+```
+
+```{r}
+dose_input <- chem_long %>%
+  full_join(
+    rareqmra,
+    by = c("SAMPLE ID" = "Date")
+  )
+```
+
+
+
+```{r}
+dosefunc <- function(data, conditions) {
+
+  results_list <- vector("list", nrow(data))
+
+  for (i in seq_len(nrow(data))) {
+
+    chemconc      <- data$Concentration[i]
+    bioconc       <- data$Reads[i]
+    chem_name     <- data$Compound[i]
+    bio_name      <- data$Genus[i]
+    sample_id     <- data$`SAMPLE ID`[i]
+    sampling_date <- data$`Sampling Date`[i]
+    sample_type   <- data$`SAMPLE TYPE`[i]
+
+    air_concs <- calculate_airconc(chemconc, conditions)
+
+    results_list[[i]] <- calculate_dose(
+      chemconc,
+      bioconc,
+      conditions,
+      air_concs,
+      chem_name,
+      bio_name,
+      sample_id,
+      sampling_date,
+      sample_type
+    )
+  }
+
+  bind_rows(results_list)
+}
+
+## Run
+dose_results <- dosefunc(dose_input, conds)
+```
+
+
+```{r}
+chemicaldoses <- dose_results %>%
+  filter(Chemical %in% chem_names)
+
+biodoses <- dose_results %>%
+  filter(Pathogen %in% qmra)
+```
+
+
+
+```{r}
+colnames(dbptox)[1] <- "Chemical"
+chemset <- left_join(chemicaldoses, dbptox, by = 'Chemical')
+```
+
+```{r}
+
+chemset <- chemset %>%
+  mutate(chemriskinhaled = InhaledChem * IUR *365)#Lifetime cancer risk single dose
+  
+chemset <- chemset %>%
+  mutate(chemriskoral = OralChem * OSF*365) 
+
+```
+
+
+
+```{r}
+## Exponential distribution annual risk
+doseresponseexp <- function(k, d){
+  infdaily1 <- 1 - exp(-k*d)
+  AnnInf <- 1 - (1 - infdaily1)^365
+  return(AnnInf)
+}
+
+## Beta-Poisson Distribution annual risk
+doseresponsebp <- function(a, n50, d){
+  infdaily2 <- 1 - ((1 + d*((2^(1/a)-1)/n50))^-a)
+  AnnInf <- 1 - (1 - infdaily2)^365
+  return(AnnInf)
+}
+
+## Apply QMRA models to dose vector
+conctoprobbacteria <- function(dosentoxdata){
+  # Preallocate result vector
+  results <- numeric(nrow(dosentoxdata))
+  
+  for (j in seq_len(nrow(dosentoxdata))) {
+    dose <- dosentoxdata$InhaledBio[j]
+    model <- dosentoxdata$ModelType[j]
+    
+    if (is.na(dosentoxdata$ModelType[j])) {
+      results[j] <- NA
+    } else if (dosentoxdata$ModelType[j] == "bp") {
+      a <- dosentoxdata$a[j]
+      N50 <- dosentoxdata$N50[j]
+      results[j] <- doseresponsebp(a, N50, dose)
+    } else if (dosentoxdata$ModelType[j] == "exp") {
+      k <- dosentoxdata$k[j]
+      results[j] <- doseresponseexp(k, dose)
+    } else {
+      results[j] <- NA
+    }
+  }
+  
+  # Return as a dataframe with same number of rows
+  dosentoxdata$AnnualRisk <- results
+  return(dosentoxdata)
+}
+
+```
+
+
+```{r}
+qmradata <- read_csv('QMRAmodels.csv')
+colnames(qmradata)[1] <- 'Pathogen'
+dosepathogen <- left_join(biodoses, qmradata, by = 'Pathogen')
+
+
+probs <- conctoprobbacteria(dosepathogen)
+
+```
+
+
+
+```{r}
+# Load disease data
+disease_data <- read_csv("finaldiseasedata.csv")
+
+# Initialize disease_params list
+disease_params <- list()
+setnum <- 10000
+
+for (i in 1:nrow(disease_data)) {
+  disease_name <- make.names(disease_data[[i, 1]])
+
+  # Sample duration
+  duration <- if (!is.na(disease_data$durlow[i])) {
+    if (grepl("normal", tolower(disease_data$durtype[i]))) {
+      rnorm(setnum, mean = disease_data$durlow[i], sd = disease_data$dursd[i])
+    } else {
+      runif(setnum, min = disease_data$durlow[i], max = disease_data$durhigh[i])
+    }
+  } else { NA }
+
+  # Sample severity
+  severity <- if (!is.na(disease_data$dwlow[i])) {
+    if (grepl("normal", tolower(disease_data$dwtype[i]))) {
+      rnorm(setnum, mean = disease_data$dwlow[i], sd = disease_data$dwsd[i])
+    } else {
+      runif(setnum, min = disease_data$dwlow[i], max = disease_data$dwup[i])
+    }
+  } else { NA }
+
+  # Build parameter list
+  disease_params[[disease_name]] <- list(
+    lostlife = disease_data$`Reduction_in_Life_Expectancy`[i],
+    mort = disease_data$`Mortality_Rate`[i],
+    duration = duration,
+    severity = severity
+  )
+}
+```
+
+
+```{r}
+# Wrapper function to calculate DALYs for all diseases
+# Simplified Monte Carlo DALY calculation for one disease
+
+DALYcalc <- function(probabilities, popservicearea, disease_params) {
+  # Check for valid inputs
+  if (is.null(disease_params$duration) || is.null(disease_params$severity)) {
+    warning("Missing duration or severity in disease_params.")
+    return(rep(NA, length(probabilities)))
+  }
+
+  if (length(probabilities) == 1) {
+    probabilities <- rep(probabilities, length(disease_params$duration))
+  }
+
+  # Ensure all vectors are the same length
+  n <- length(probabilities)
+  if (length(disease_params$duration) != n || length(disease_params$severity) != n) {
+    stop("Length mismatch between probabilities, duration, and severity.")
+  }
+
+  YLL <- probabilities * disease_params$lostlife * popservicearea * disease_params$mort
+  prevalence <- probabilities * popservicearea * disease_params$duration
+  YLD <- prevalence * disease_params$severity
+
+  DALY_samples <- YLL + YLD
+  return(DALY_samples)
+}
+
+```
+
+
+```{r}
+
+set.seed(123)  # for reproducibility
+popservicearea <- 10000
+daly_results_bio <- numeric(nrow(probs))
+
+for (i in seq_len(nrow(probs))) {
+  disease <- probs$Pathogen[i]
+  prob <- probs$AnnualRisk[i]
+  params <- disease_params[[disease]]
+
+  if (is.null(params)) {
+    warning(paste("No parameters found for disease:", disease))
+    next
+  }
+
+  # Randomly sample one value from duration and severity
+  duration <- sample(params$duration, 1)
+  severity <- sample(params$severity, 1)
+
+  YLL <- prob * params$lostlife * popservicearea * params$mort
+  prevalence <- prob * popservicearea * duration
+  YLD <- prevalence * severity
+
+  daly_results_bio[i] <- YLL + YLD
+}
+
+# Add to your data frame
+probs$DALY <- daly_results_bio
+
+```
+
+# ```{r}
+# set.seed(123)  # for reproducibility
+# popservicearea <- 10000
+# daly_results_oc <- numeric(nrow(chemset))
+# 
+# for (i in seq_len(nrow(chemset))) {
+#   disease <- chemset$Chemical[i]
+#   prob <- chemset$chemriskoral[i]
+#   params <- disease_params[["Bladder_Cancer"]]
+# 
+#   if (is.null(params)) {
+#     warning(paste("No parameters found for disease:", disease))
+#     next
+#   }
+# 
+#   # Randomly sample one value from duration and severity
+#   duration <- sample(params$duration, 1)
+#   severity <- sample(params$severity, 1)
+# 
+#   YLL <- prob * params$lostlife * popservicearea * params$mort
+#   prevalence <- prob * popservicearea * duration
+#   YLD <- prevalence * severity
+# 
+#   daly_results_oc[i] <- YLL + YLD
+# }
+# 
+# # Add to your data frame
+# chemset$DALYoral <- daly_results_oc
+# 
+# ```
+
+```{r}
+set.seed(123)
+
+popservicearea <- 10000
+n <- nrow(chemset)
+daly_results_oc <- numeric(n)
+
+# Pull params ONCE
+params <- disease_params[["Bladder_Cancer"]]
+if (is.null(params)) stop("Bladder_Cancer params missing")
+
+# Pre-sample duration and severity ONCE
+duration_vec <- sample(params$duration, n, replace = TRUE)
+severity_vec <- sample(params$severity, n, replace = TRUE)
+
+prob <- chemset$chemriskoral
+
+YLL <- prob * params$lostlife * popservicearea * params$mort
+prevalence <- prob * popservicearea * duration_vec
+YLD <- prevalence * severity_vec
+
+chemset$DALYoral <- YLL + YLD
+```
+
+
+
+```{r}
+set.seed(123)
+
+popservicearea <- 10000
+n <- nrow(chemset)
+daly_results_ic <- numeric(n)
+
+# Pull params ONCE
+params <- disease_params[["Bladder_Cancer"]]
+if (is.null(params)) stop("Bladder_Cancer params missing")
+
+# Pre-sample duration and severity ONCE
+duration_vec <- sample(params$duration, n, replace = TRUE)
+severity_vec <- sample(params$severity, n, replace = TRUE)
+
+prob <- chemset$chemriskinhaled
+
+YLL <- prob * params$lostlife * popservicearea * params$mort
+prevalence <- prob * popservicearea * duration_vec
+YLD <- prevalence * severity_vec
+
+chemset$DALYinh <- YLL + YLD
+
+```
+
+
+```{r}
+
+oral_long <- chemset %>%
+  transmute(
+    `SAMPLE ID`,
+    SamplingDate,
+    SampleType,
+    Chemical,
+    type = "oral",
+    DALY_value = DALYoral
+  )
+
+inh_long <- chemset %>%
+  transmute(
+    `SAMPLE ID`,
+    SamplingDate,
+    SampleType,
+    Chemical,
+    type = "inhalation",
+    DALY_value = DALYinh
+  )
+
+path_long <- probs %>%
+  transmute(
+    `SAMPLE ID`,
+    SamplingDate,
+    SampleType,
+    Pathogen,
+    type = "pathogen",
+    DALY_value = DALY
+  )
+
+```
+
+```{r}
+set.seed(123)
+inh_small <- inh_long[sample(nrow(inh_long), 1e6), ]
+oral_small <- oral_long[sample(nrow(oral_long), 1e6), ]
+path_small <- path_long[sample(nrow(path_long), 1e6), ]
+
+```
+
+```{r}
+df_small <- bind_rows(oral_small, inh_small, path_small) %>%
+  mutate(Combined = coalesce(Chemical,Pathogen))
+
+```
+
+
+```{r}
+
+df_small$type <- gsub("pathogen", "Inhaled Pathogens", df_small$type, ignore.case = TRUE)
+df_small$type <- gsub("oral", "Ingested DBPs", df_small$type, ignore.case = TRUE)
+df_small$type <- gsub("inhalation", "Inhaled DBPs", df_small$type, ignore.case = TRUE)
+
+```
+
+
+```{r}
+plot1 <- ggplot(df_small, aes(x = DALY_value, color = type)) +
+  geom_freqpoly() + scale_y_log10() +
+  labs(
+    x = "Log10 DALYs Lost Annually/10 thousand people",
+    y = "Number of Simulations",
+    fill = "Exposure Type",
+    title = 'Contribution of Risk Types to Drinking Water Risk'
+  ) 
+plot1
+
+```
+
+
+
+```{r}
+df_merge <- df_small %>%
+  mutate(Combined = coalesce(Chemical, Pathogen))
+
+plot2 <- ggplot(df_merge, aes(x= DALY_value, color = Combined)) + geom_freqpoly()
+plot2
+```
+
