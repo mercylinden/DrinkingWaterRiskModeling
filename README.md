@@ -3,6 +3,8 @@ This repository contains the most recent iterations of the analysis code that wa
 
 # Required Packages
 
+This model relies upon the tidyverse, data.table, mpower and EnvStats packages, which are loaded at the start of the code but must be installed before use using install.packages on the local operating system. 
+
 # Input Data Format
 
 
